@@ -12,9 +12,6 @@
 #include <linux/gfp.h>
 #include <linux/smp.h>
 #include <linux/cpu.h>
-#ifdef CONFIG_DEBUG_CSD_LOCK
-#include <linux/reboot.h>
-#endif
 
 #ifdef CONFIG_USE_GENERIC_SMP_HELPERS
 static struct {
@@ -34,9 +31,7 @@ struct call_function_data {
 	struct call_single_data	csd;
 	atomic_t		refs;
 	cpumask_var_t		cpumask;
-#ifdef CONFIG_DEBUG_CSD_LOCK
-	cpumask_var_t		cpumask_run;
-#endif
+	cpumask_var_t		cpumask_ipi;
 };
 
 static DEFINE_PER_CPU_SHARED_ALIGNED(struct call_function_data, cfd_data);
@@ -60,6 +55,9 @@ hotplug_cfd(struct notifier_block *nfb, unsigned long action, void *hcpu)
 		if (!zalloc_cpumask_var_node(&cfd->cpumask, GFP_KERNEL,
 				cpu_to_node(cpu)))
 			return notifier_from_errno(-ENOMEM);
+		if (!zalloc_cpumask_var_node(&cfd->cpumask_ipi, GFP_KERNEL,
+				cpu_to_node(cpu)))
+			return notifier_from_errno(-ENOMEM);
 		break;
 
 #ifdef CONFIG_HOTPLUG_CPU
@@ -69,6 +67,7 @@ hotplug_cfd(struct notifier_block *nfb, unsigned long action, void *hcpu)
 	case CPU_DEAD:
 	case CPU_DEAD_FROZEN:
 		free_cpumask_var(cfd->cpumask);
+		free_cpumask_var(cfd->cpumask_ipi);
 		break;
 #endif
 	};
@@ -96,31 +95,6 @@ void __init call_function_init(void)
 	register_cpu_notifier(&hotplug_cfd_notifier);
 }
 
-#ifdef CONFIG_DEBUG_CSD_LOCK
-#define CSD_LOCK_WAIT_TIMEOUT_MS	(CONFIG_DEBUG_CSD_LOCK_TIMEOUT_MS)
-static void csd_info_dump(void)
-{
-	struct call_function_data *data;
-
-	char buf_cpu_run[16] = {0};
-	char buf_cpu_wait[16] = {0};
-	smp_call_func_t func;
-
-	/* List all queued call functions and check which cpu does not finish them. */
-	pr_info("%s: CSD Queue:\n", __func__);
-	list_for_each_entry_rcu(data, &call_function.queue, csd.list) {
-		func = data->csd.func;
-
-		cpulist_scnprintf(buf_cpu_run, sizeof(buf_cpu_run), data->cpumask_run);
-		cpulist_scnprintf(buf_cpu_wait, sizeof(buf_cpu_wait), data->cpumask);
-		pr_info("Entry: Func=[<%08lx>] (%pS), Ref=%d, CpuRun=%s, CpuWait=%s\n",
-			(unsigned long) func, (void *)func,
-			atomic_read(&data->refs),
-			buf_cpu_run, buf_cpu_wait);
-	}
-}
-#endif
-
 /*
  * csd_lock/csd_unlock used to serialize access to per-cpu csd resources
  *
@@ -130,28 +104,8 @@ static void csd_info_dump(void)
  */
 static void csd_lock_wait(struct call_single_data *data)
 {
-#ifdef CONFIG_DEBUG_CSD_LOCK
-	unsigned long start = jiffies;
-	unsigned long now;
-#endif
-
-	while (data->flags & CSD_FLAG_LOCK) {
+	while (data->flags & CSD_FLAG_LOCK)
 		cpu_relax();
-
-#ifdef CONFIG_DEBUG_CSD_LOCK
-		now = jiffies;
-		/* if overflow happens, just reset start time. This does not matter.*/
-		if (now < start)
-			start = now;
-
-		/* if csd lock waits too long, show debug info and panic */
-		if (((jiffies_to_msecs(now - start)) > CSD_LOCK_WAIT_TIMEOUT_MS)) {
-			WARN(1, "%s: CSD lock waiting time exceeds %d miliseconds.\n", __func__, CSD_LOCK_WAIT_TIMEOUT_MS);
-			csd_info_dump();
-			kernel_restart("force-dog-bark");
-		}
-#endif
-	}
 }
 
 static void csd_lock(struct call_single_data *data)
@@ -207,10 +161,7 @@ void generic_exec_single(int cpu, struct call_single_data *data, int wait)
 	 * locking and barrier primitives. Generic code isn't really
 	 * equipped to do the right thing...
 	 */
-
-	smp_mb();
-
-	if (ipi || wait)
+	if (ipi)
 		arch_send_call_function_single_ipi(cpu);
 
 	if (wait)
@@ -264,11 +215,6 @@ void generic_smp_call_function_interrupt(void)
 
 		if (atomic_read(&data->refs) == 0)
 			continue;
-
-#ifdef CONFIG_DEBUG_CSD_LOCK
-		/* save running cpu for later debug */
-		cpumask_set_cpu(cpu, data->cpumask_run);
-#endif
 
 		func = data->csd.func;		/* save for later warn */
 		func(data->csd.info);
@@ -369,20 +315,20 @@ int smp_call_function_single(int cpu, smp_call_func_t func, void *info,
 	 */
 	this_cpu = get_cpu();
 
-	/*
-	 * Can deadlock when called with interrupts disabled.
-	 * We allow cpu's that are not yet online though, as no one else can
-	 * send smp call function interrupt to this cpu and as such deadlocks
-	 * can't happen.
-	 */
-	WARN_ON_ONCE(cpu_online(this_cpu) && irqs_disabled()
-		     && !oops_in_progress);
-
 	if (cpu == this_cpu) {
 		local_irq_save(flags);
 		func(info);
 		local_irq_restore(flags);
 	} else {
+		/*
+		 * Can deadlock when called with interrupts disabled.
+		 * We allow cpu's that are not yet online though, as no one else
+		 * can send smp call function interrupt to this cpu and as such
+		 * deadlocks can't happen.
+		 */
+		WARN_ON_ONCE(cpu_online(this_cpu) && irqs_disabled()
+			     && !oops_in_progress);
+
 		if ((unsigned)cpu < nr_cpu_ids && cpu_online(cpu)) {
 			struct call_single_data *data = &d;
 
@@ -467,20 +413,21 @@ void __smp_call_function_single(int cpu, struct call_single_data *data,
 	unsigned long flags;
 
 	this_cpu = get_cpu();
-	/*
-	 * Can deadlock when called with interrupts disabled.
-	 * We allow cpu's that are not yet online though, as no one else can
-	 * send smp call function interrupt to this cpu and as such deadlocks
-	 * can't happen.
-	 */
-	WARN_ON_ONCE(cpu_online(smp_processor_id()) && wait && irqs_disabled()
-		     && !oops_in_progress);
 
 	if (cpu == this_cpu) {
 		local_irq_save(flags);
 		data->func(data->info);
 		local_irq_restore(flags);
 	} else {
+		/*
+		 * Can deadlock when called with interrupts disabled.
+		 * We allow cpu's that are not yet online though, as no one else
+		 * can send smp call function interrupt to this cpu and as such
+		 * deadlocks can't happen.
+		 */
+		WARN_ON_ONCE(cpu_online(smp_processor_id()) && wait
+			     && irqs_disabled() && !oops_in_progress);
+
 		csd_lock(data);
 		generic_exec_single(cpu, data, wait);
 	}
@@ -572,11 +519,6 @@ void smp_call_function_many(const struct cpumask *mask,
 	/* Ensure 0 refs is visible before mask.  Also orders func and info */
 	smp_wmb();
 
-#ifdef CONFIG_DEBUG_CSD_LOCK
-	/* Reset running cpu map */
-	cpumask_clear(data->cpumask_run);
-#endif
-
 	/* We rely on the "and" being processed before the store */
 	cpumask_and(data->cpumask, mask, cpu_online_mask);
 	cpumask_clear_cpu(this_cpu, data->cpumask);
@@ -588,6 +530,12 @@ void smp_call_function_many(const struct cpumask *mask,
 		return;
 	}
 
+	/*
+	 * After we put an entry into the list, data->cpumask
+	 * may be cleared again when another CPU sends another IPI for
+	 * a SMP function call, so data->cpumask will be zero.
+	 */
+	cpumask_copy(data->cpumask_ipi, data->cpumask);
 	raw_spin_lock_irqsave(&call_function.lock, flags);
 	/*
 	 * Place entry at the _HEAD_ of the list, so that any cpu still
@@ -611,7 +559,7 @@ void smp_call_function_many(const struct cpumask *mask,
 	smp_mb();
 
 	/* Send a message to all CPUs in the map */
-	arch_send_call_function_ipi_mask(data->cpumask);
+	arch_send_call_function_ipi_mask(data->cpumask_ipi);
 
 	/* Optionally wait for the CPUs to complete */
 	if (wait)
